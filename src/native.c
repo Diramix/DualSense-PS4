@@ -119,6 +119,10 @@ typedef struct {
 _Static_assert(sizeof(PadSample) == 120, "PadSample size");
 struct VirtualPad {
     int handle;
+    int initialized;
+    int (*add)(void *, int);
+    unsigned failures;
+    u64 retry_at;
     int (*insert)(int, const void *);
     int (*remove)(int);
     int (*feedback)(int, void *);
@@ -134,12 +138,15 @@ static const char *find_text(const char *text, const char *needle) {
 static int virtual_start(long log, struct VirtualPad *out, int (*sleep_us)(u32)) {
     int (*load)(const char *, u64, void *, u32, void *, int *) = 0;
     if (call3(591, 0x2001, (long)"sceKernelLoadStartModule", (long)&load) || !load) return -1;
+    int module = 0;
+    int (*add)(void *, int) = 0;
+    if (!out->initialized) {
     int mbus = load("/system/common/lib/libSceMbus.sprx", 0, 0, 0, 0, 0);
     record(log, "load_mbus", mbus);
-    int module = load("/system/common/lib/libScePad.sprx", 0, 0, 0, 0, 0);
+    module = load("/system/common/lib/libScePad.sprx", 0, 0, 0, 0, 0);
     record(log, "load_pad", module);
     if (module < 0) return -2;
-    int (*init)(void) = 0, (*privilege)(int) = 0, (*add)(void *, int) = 0;
+    int (*init)(void) = 0, (*privilege)(int) = 0;
     if (call3(591, module, (long)"scePadInit", (long)&init) ||
         call3(591, module, (long)"scePadSetProcessPrivilege", (long)&privilege) ||
         call3(591, module, (long)"scePadVirtualDeviceAddDevice", (long)&add) ||
@@ -153,6 +160,9 @@ static int virtual_start(long log, struct VirtualPad *out, int (*sleep_us)(u32))
     rc = privilege(1);
     record(log, "pad_privilege", rc);
     if (rc) return -5;
+        out->add = add;
+        out->initialized = 1;
+    } else add = out->add;
     long fd = call3(5, (long)"/dev/klog", 4, 0);
     record(log, "open_klog", fd);
     if (fd < 0) return -6;
@@ -199,6 +209,46 @@ static int virtual_start(long log, struct VirtualPad *out, int (*sleep_us)(u32))
     call3(6, fd, 0, 0);
     record(log, "virtual_handle", out->handle);
     return out->handle < 0 ? -7 : 0;
+}
+
+
+static int resume_gap(u64 previous, u64 current, long previous_wall, long current_wall) {
+    return current < previous || current - previous > 3000000 ||
+        (previous_wall > 0 && current_wall > 0 &&
+         (current_wall < previous_wall || current_wall - previous_wall > 3));
+}
+
+static long wall_seconds(void) {
+    struct { long seconds, microseconds; } time = {0, 0};
+    return call3(116, (long)&time, 0, 0) ? 0 : time.seconds;
+}
+
+static void virtual_reset(long log, struct VirtualPad *pad, u64 time) {
+    if (pad->handle >= 0) record(log, "retire_virtual", pad->remove(pad->handle));
+    pad->handle = -1;
+    pad->failures = 0;
+    pad->retry_at = time;
+}
+
+static void virtual_update(long log, struct VirtualPad *pad, const PadSample *sample, u64 time,
+                           int (*sleep_us)(u32), u64 *inserted, u64 *failed) {
+    if (pad->handle >= 0) {
+        int rc = pad->insert(pad->handle, sample);
+        if (!rc) {
+            pad->failures = 0;
+            ++*inserted;
+            return;
+        }
+        ++*failed;
+        if (!pad->failures) record(log, "insert_error", rc);
+        if (++pad->failures < 3) return;
+        virtual_reset(log, pad, time + 1000000);
+    }
+    if (time < pad->retry_at) return;
+    pad->retry_at = time + 5000000;
+    int rc = virtual_start(log, pad, sleep_us);
+    record(log, "virtual_recovery", rc);
+    if (!rc) notify("DualSense: controller restored. Select your PS4 user if prompted.");
 }
 
 struct CapacityRequest { u64 address; u32 restore, original; };
@@ -300,7 +350,7 @@ static void extended_sample(PadSample *sample, const DualSenseState *state, cons
 }
 
 static int native_run(void) {
-    long log = call3(5, (long)"/data/dualsense_native.log", 0x601, 0644);
+    long log = call3(5, (long)"/data/dualsense_native.log", 0x209, 0644);
     if (log < 0) return 1;
     int (*version)(void *) = 0;
     int (*sleep_us)(u32) = 0;
@@ -391,8 +441,19 @@ static int native_run(void) {
     u64 events = 0;
     u64 reports = 0;
     long last_read_error = 0;
+    u64 last_iteration = now();
+    long last_wall = wall_seconds();
+    record(log, "wall_clock", last_wall);
     for (;;) {
         u64 current_time = now();
+        long current_wall = wall_seconds();
+        if (resume_gap(last_iteration, current_time, last_wall, current_wall)) {
+            record(log, "resume_gap", current_time - last_iteration);
+            record(log, "resume_wall_gap", current_wall - last_wall);
+            break;
+        }
+        last_iteration = current_time;
+        last_wall = current_wall;
         if (current_time - last_stop_check >= 500000) {
             last_stop_check = current_time;
             long stop = call3(5, (long)"/data/dualsense_native.stop", 0, 0);
@@ -423,7 +484,7 @@ static int native_run(void) {
         }
         if (physical_address && current_time - last_output >= 20000) {
             u8 feedback[256] = {0};
-            if (virtual_pad.feedback) virtual_pad.feedback(virtual_pad.handle, feedback);
+            if (virtual_pad.handle >= 0 && virtual_pad.feedback) virtual_pad.feedback(virtual_pad.handle, feedback);
             u8 values[5] = {feedback[3], feedback[4], feedback[5], feedback[6], feedback[7]};
             if (current_time - last_input >= 500000) values[0] = values[1] = 0;
             if (values[0] > maximum_large) maximum_large = values[0];
@@ -468,13 +529,9 @@ static int native_run(void) {
             for (unsigned i = 0; i < 24; ++i) sample.touch[i] = 0;
             for (unsigned i = 0; i < 3; ++i) sample.angular_velocity[i] = 0;
         }
-        if (virtual_pad.handle >= 0) {
-            sample.timestamp = current_time;
-            ++sample.count;
-            long result = virtual_pad.insert(virtual_pad.handle, &sample);
-            if (!result) ++inserted;
-            else if (++insert_failures == 1) record(log, "insert_error", result);
-        }
+        sample.timestamp = current_time;
+        ++sample.count;
+        virtual_update(log, &virtual_pad, &sample, current_time, sleep_us, &inserted, &insert_failures);
         if (!ready) { sleep_us(10000); continue; }
         u8 buffer[256];
         long count = call3(3, fd, (long)buffer, sizeof(buffer));
@@ -504,6 +561,14 @@ static int native_run(void) {
                 if (result >= 2 && result <= 80 && report[0] + 2 == result && report[1] == 0x1f) {
                     DualSenseState state;
                     if (!dualsense_decode_bluetooth(report + 2, (unsigned long)result - 2, &state)) {
+                        u64 input_time = now();
+                        if (decoded && input_time - last_input > 3000000) {
+                            record(log, "bluetooth_resume_gap", input_time - last_input);
+                            virtual_reset(log, &virtual_pad, input_time);
+                            initialized_output = 0;
+                            calibration_requested = 0;
+                            last_motion = 0;
+                        }
                         physical_address = address;
                         if (state.extended) {
                             ++extended_count;
@@ -567,7 +632,16 @@ static int native_run(void) {
 }
 
 __attribute__((used)) static void *native_worker(void *guard) {
-    int rc = native_run();
+    int (*sleep_us)(u32) = 0;
+    call3(591, 0x2001, (long)"sceKernelUsleep", (long)&sleep_us);
+    int rc;
+    for (;;) {
+        rc = native_run();
+        long stop = call3(5, (long)"/data/dualsense_native.stop", 0, 0);
+        if (stop >= 0) { call3(6, stop, 0, 0); break; }
+        if (!sleep_us || rc == 2 || rc == 3 || rc == 4 || rc == 8) break;
+        sleep_us(3000000);
+    }
     call3(6, (long)guard, 0, 0);
     return (void *)(long)rc;
 }
