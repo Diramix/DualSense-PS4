@@ -125,7 +125,7 @@ int dualsense_calibration_bluetooth(const uint8_t *report, size_t length, DualSe
         if (!denominator || range <= 0) return -3;
         result.gyro_scale[i] = speed * 0.01745329252f / denominator;
         result.accel_scale[i] = 2.0f / range;
-        result.accel_bias[i] = accel_plus - range / 2;
+        result.accel_bias[i] = accel_plus - range / 2.0f;
     }
     *calibration = result;
     return 0;

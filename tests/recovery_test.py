@@ -13,11 +13,10 @@ typedef unsigned long u64;
 typedef unsigned int u32;
 typedef struct { int value; } PadSample;
 STRUCTURE
-static int result, removed, starts, start_result, notices;
+static int result, removed, starts, start_result;
 static int insert(int handle, const void *sample) { assert(handle == 42); assert(sample); return result; }
 static int remove_pad(int handle) { assert(handle == 42); ++removed; return 0; }
 static void record(long fd, const char *key, long value) { (void)fd; (void)key; (void)value; }
-static void notify(const char *text) { assert(text); ++notices; }
 static int virtual_start(long fd, struct VirtualPad *pad, int (*sleep_us)(u32)) {
     (void)fd; (void)sleep_us; ++starts;
     if (!start_result) pad->handle = 42;
@@ -48,19 +47,19 @@ int main(void) {
     assert(!starts);
     start_result=-1;
     virtual_update(0,&pad,&sample,1000500,0,&ok,&failed);
-    assert(starts==1 && pad.handle==-1 && !notices);
+    assert(starts==1 && pad.handle==-1);
     virtual_update(0,&pad,&sample,6000499,0,&ok,&failed);
     assert(starts==1);
     start_result=0;
     virtual_update(0,&pad,&sample,6000500,0,&ok,&failed);
-    assert(starts==2 && pad.handle==42 && notices==1);
+    assert(starts==2 && pad.handle==42);
     result=0;
     virtual_update(0,&pad,&sample,6000600,0,&ok,&failed);
     assert(ok==3 && failed==4 && !pad.failures);
     virtual_reset(0,&pad,7000000);
     assert(pad.handle==-1 && removed==2);
     virtual_update(0,&pad,&sample,7000000,0,&ok,&failed);
-    assert(pad.handle==42 && starts==3 && notices==2);
+    assert(pad.handle==42 && starts==3);
 }
 '''.replace('STRUCTURE', structure).replace('FUNCTION', function).replace('GAP', gap)
 with tempfile.TemporaryDirectory() as directory:

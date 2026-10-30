@@ -1,4 +1,4 @@
-#include "version.h"
+
 typedef __SIZE_TYPE__ NativeSize;
 void *memset(void *pointer, int value, NativeSize length) {
     unsigned char *bytes = pointer;
@@ -248,7 +248,6 @@ static void virtual_update(long log, struct VirtualPad *pad, const PadSample *sa
     pad->retry_at = time + 5000000;
     int rc = virtual_start(log, pad, sleep_us);
     record(log, "virtual_recovery", rc);
-    if (!rc) notify("DualSense: controller restored. Select your PS4 user if prompted.");
 }
 
 struct CapacityRequest { u64 address; u32 restore, original; };
@@ -363,7 +362,6 @@ static int native_run(void) {
     record(log, "get_version", rc);
     record(log, "firmware", info.version);
     if (rc || (info.version >> 16) != 0x1250) {
-        notify("DualSense probe: requires firmware 12.50. See /data/dualsense_native.log");
         call3(6, log, 0, 0);
         return 3;
     }
@@ -390,7 +388,7 @@ static int native_run(void) {
     struct PatchRequest patch_request = {0};
     rc = call3(11, (long)patch_allowlist, (long)&patch_request, 0);
     record(log, "apply_temporary_allowlist", rc);
-    if (rc) { notify("DualSense: driver validation failed. See /data/dualsense_native.log"); call3(6, queue, 0, 0); call3(6, fd, 0, 0); call3(6, log, 0, 0); return 8; }
+    if (rc) { call3(6, queue, 0, 0); call3(6, fd, 0, 0); call3(6, log, 0, 0); return 8; }
     struct { u16 vendor; u16 product; } device = { 0x054c, 0x0ce6 };
     rc = call3(54, fd, 0x8004622bUL, (long)&device);
     record(log, "register_dualsense", rc);
@@ -413,7 +411,6 @@ static int native_run(void) {
         call3(6, queue, 0, 0);
         call3(6, fd, 0, 0);
         call3(6, log, 0, 0);
-        notify("DualSense: virtual controller creation failed. See /data/dualsense_native.log");
         return 9;
     }
     PadSample sample = {0};
@@ -425,13 +422,13 @@ static int native_run(void) {
     u64 last_input = now(), last_stop_check = 0, last_telemetry = 0;
     long data = call3(5, (long)"/data/dualsense_native_events.bin", 0x601, 0644);
     record(log, "open_events", data);
-    notify("DualSense-PS4 " DUALSENSE_PS4_VERSION ": Bluetooth ready Reconnect DualSense and choose a PS4 user");
     u64 physical_address = 0, last_output = 0, last_motion = 0, rumble_test = 0, last_calibration_attempt = 0;
     u64 extended_count = 0, output_ok = 0, output_errors = 0, touch_count = 0, motion_count = 0, rumble_sent = 0;
     u8 maximum_large = 0, maximum_small = 0;
     u32 original_capacity = 0;
     u8 output_sequence = 0, previous_feedback[5] = {255,255,255,255,255};
     int initialized_output = 0, calibration_requested = 0, calibration_valid = 0;
+    int controller_connected = 0;
     DualSenseCalibration calibration;
     for (unsigned i = 0; i < 3; ++i) {
         calibration.gyro_scale[i] = 2000.0f / 32768.0f * 0.01745329252f;
@@ -454,6 +451,10 @@ static int native_run(void) {
         }
         last_iteration = current_time;
         last_wall = current_wall;
+        if (controller_connected && current_time - last_input > 3000000) {
+            controller_connected = 0;
+            notify("DualSense disconnected");
+        }
         if (current_time - last_stop_check >= 500000) {
             last_stop_check = current_time;
             long stop = call3(5, (long)"/data/dualsense_native.stop", 0, 0);
@@ -562,6 +563,10 @@ static int native_run(void) {
                     DualSenseState state;
                     if (!dualsense_decode_bluetooth(report + 2, (unsigned long)result - 2, &state)) {
                         u64 input_time = now();
+                        if (!controller_connected) {
+                            controller_connected = 1;
+                            notify("DualSense connected");
+                        }
                         if (decoded && input_time - last_input > 3000000) {
                             record(log, "bluetooth_resume_gap", input_time - last_input);
                             virtual_reset(log, &virtual_pad, input_time);
@@ -627,7 +632,6 @@ static int native_run(void) {
     call3(6, fd, 0, 0);
     record(log, "complete", 1);
     call3(6, log, 0, 0);
-    notify("DualSense native Bluetooth stopped Driver checks restored");
     return 0;
 }
 
@@ -654,7 +658,6 @@ __attribute__((section(".text.entry"))) int _start(void) {
     };
     if (call3(104, guard, (long)&address, sizeof(address)) < 0) {
         call3(6, guard, 0, 0);
-        notify("DualSense native Bluetooth is already running, or its local port is unavailable");
         return 2;
     }
     void *(*map)(void *, u64, int, int, int, u64) = 0;
