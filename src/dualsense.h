@@ -13,6 +13,7 @@ typedef struct {
     uint8_t mute;
     uint8_t extended;
     uint8_t battery;
+    uint8_t battery_status;
     int16_t gyro[3];
     int16_t accel[3];
     uint16_t touch_x[2];

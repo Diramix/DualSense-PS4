@@ -62,6 +62,7 @@ int dualsense_decode_bluetooth(const uint8_t *report, size_t length, DualSenseSt
     if (length == 78) {
         result.extended = 1;
         result.battery = data[52] & 15;
+        result.battery_status = data[52] >> 4;
         for (unsigned i = 0; i < 3; ++i) {
             result.gyro[i] = (int16_t)((uint16_t)data[15 + i * 2] | ((uint16_t)data[16 + i * 2] << 8));
             result.accel[i] = (int16_t)((uint16_t)data[21 + i * 2] | ((uint16_t)data[22 + i * 2] << 8));

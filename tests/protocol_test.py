@@ -27,6 +27,13 @@ with tempfile.TemporaryDirectory() as directory:
         packet[74:] = zlib.crc32(b'\xa1' + packet[:74]).to_bytes(4, 'little')
         assert decode(bytes(packet), 78, state) == 0
         assert struct.unpack_from('<I', state.raw)[0] == expected
+    for status, level in [(0, 0), (0, 8), (1, 5), (2, 10), (15, 0)]:
+        packet = bytearray(78)
+        packet[0], packet[9], packet[54] = 0x31, 8, status << 4 | level
+        packet[74:] = zlib.crc32(b'\xa1' + packet[:74]).to_bytes(4, 'little')
+        assert decode(bytes(packet), 78, state) == 0
+        assert state.raw[12] == level
+        assert state.raw[13] == status
     saved = state.raw
     packet = bytearray(78)
     packet[0], packet[9] = 0x31, 8

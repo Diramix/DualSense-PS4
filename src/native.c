@@ -29,12 +29,6 @@ __attribute__((noinline)) static long call6(long number, long a, long b, long c,
     return result;
 }
 
-static u64 length(const char *text) {
-    u64 count = 0;
-    while (text[count]) ++count;
-    return count;
-}
-
 static void record(long fd, const char *name, long value) {
     char line[96];
     u64 count = 0;
@@ -48,18 +42,7 @@ static void record(long fd, const char *name, long value) {
     call3(4, fd, (long)line, count);
 }
 
-static void notify(const char *message) {
-    int (*send)(int, void *, u64, int) = 0;
-    if (call3(591, 0x2001, (long)"sceKernelSendNotificationRequest", (long)&send) || !send)
-        return;
-    u8 request[0xc30];
-    for (u64 i = 0; i < sizeof(request); ++i) request[i] = 0;
-    *(int *)(request + 0x10) = -1;
-    u64 count = length(message);
-    if (count > 1023) count = 1023;
-    for (u64 i = 0; i < count; ++i) request[0x2d + i] = message[i];
-    send(0, request, sizeof(request), 0);
-}
+
 
 struct PatchRequest { int restore; };
 struct PatchArgs { void *function; struct PatchRequest *request; };
@@ -223,15 +206,61 @@ static long wall_seconds(void) {
     return call3(116, (long)&time, 0, 0) ? 0 : time.seconds;
 }
 
+struct BatteryRequest { u32 handle, level, status, restore; };
+struct BatteryArgs { void *function; struct BatteryRequest *request; };
+static int controller_battery(void *thread, struct BatteryArgs *args) {
+    (void)thread;
+    u32 low, high;
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(0xc0000082));
+    u64 base = (((u64)high << 32) | low) - 0x1c0;
+    struct BatteryRequest *r = args->request;
+    if ((base >> 48) != 0xffff || (base & 0x3fff) || !r || r->restore > 1) return 22;
+    if (*(u64 *)(base + 0x5b6d00) != 0x56415741e5894855UL) return 22;
+    volatile u8 *code = (void *)(base + 0x5f441a);
+    if (code[0] != 0x8a || code[1] != 0x43 || code[2] != 0x18 || code[3] != 0x24 || code[4] != 0xfe || code[5] != 0x3c || (code[6] != 0x02 && code[6] != 0xff) || code[7] != 0x0f || code[8] != 0x84) return 22;
+    int (*lock)(void) = (void *)(base + 0x5dac00);
+    void (*unlock)(void) = (void *)(base + 0x5dac60);
+    int rc = lock();
+    if (rc) return rc;
+    if (!r->restore) {
+        if ((r->handle & 0xffff) != 0x030d || r->level > 100 || r->status > 2) { unlock(); return 22; }
+        u8 *ctx = *(void **)(base + 0x2646f90 + 13 * 8);
+        if (!ctx || ((u64)ctx >> 48) != 0xffff || *(u32 *)(ctx + 4) != r->handle || ctx[0x18] != 3 || *(u16 *)(ctx + 0x28) != 0x054c || *(u16 *)(ctx + 0x2a) != 0x05c4) { unlock(); return 2; }
+        u8 *state = *(void **)(ctx + 0x130);
+        if (!state || ((u64)state >> 48) != 0xffff) { unlock(); return 2; }
+        *(u32 *)(state + 0x5ea0) = r->status;
+        state[0x5ea4] = (u8)r->level;
+    }
+    u64 flags, cr0;
+    __asm__ volatile("pushfq; popq %0; cli; mov %%cr0,%1" : "=r"(flags), "=r"(cr0) :: "memory");
+    u64 writable = cr0 & ~(1UL << 16);
+    __asm__ volatile("mov %0,%%cr0" :: "r"(writable) : "memory");
+    code[6] = r->restore ? 0x02 : 0xff;
+    __asm__ volatile("mov %0,%%cr0; pushq %1; popfq" :: "r"(cr0), "r"(flags) : "memory", "cc");
+    unlock();
+    return 0;
+}
+
 static void virtual_reset(long log, struct VirtualPad *pad, u64 time) {
-    if (pad->handle >= 0) record(log, "retire_virtual", pad->remove(pad->handle));
+    if (pad->handle >= 0) {
+        int rc = pad->remove(pad->handle);
+        record(log, "retire_virtual", rc);
+        if (rc) return;
+    }
     pad->handle = -1;
     pad->failures = 0;
     pad->retry_at = time;
 }
 
 static void virtual_update(long log, struct VirtualPad *pad, const PadSample *sample, u64 time,
-                           int (*sleep_us)(u32), u64 *inserted, u64 *failed) {
+                           int (*sleep_us)(u32), u64 *inserted, u64 *failed, int connected) {
+    if (!connected) {
+        if (pad->handle >= 0 && time >= pad->retry_at) {
+            virtual_reset(log, pad, time + 1000000);
+            if (pad->handle >= 0) pad->retry_at = time + 1000000;
+        }
+        return;
+    }
     if (pad->handle >= 0) {
         int rc = pad->insert(pad->handle, sample);
         if (!rc) {
@@ -402,17 +431,6 @@ static int native_run(void) {
         return 8;
     }
     struct VirtualPad virtual_pad = {.handle = -1};
-    int virtual_result = virtual_start(log, &virtual_pad, sleep_us);
-    record(log, "virtual_start", virtual_result);
-    if (virtual_result) {
-        if (registered) call3(54, fd, 0x8004622cUL, (long)&device);
-        patch_request.restore = 1;
-        record(log, "restore_allowlist", call3(11, (long)patch_allowlist, (long)&patch_request, 0));
-        call3(6, queue, 0, 0);
-        call3(6, fd, 0, 0);
-        call3(6, log, 0, 0);
-        return 9;
-    }
     PadSample sample = {0};
     sample.lx = sample.ly = sample.rx = sample.ry = 128;
     sample.orientation[3] = 1.0f;
@@ -423,6 +441,8 @@ static int native_run(void) {
     long data = call3(5, (long)"/data/dualsense_native_events.bin", 0x601, 0644);
     record(log, "open_events", data);
     u64 physical_address = 0, last_output = 0, last_motion = 0, rumble_test = 0, last_calibration_attempt = 0;
+    u64 last_battery = 0;
+    int battery_active = 0;
     u64 extended_count = 0, output_ok = 0, output_errors = 0, touch_count = 0, motion_count = 0, rumble_sent = 0;
     u8 maximum_large = 0, maximum_small = 0;
     u32 original_capacity = 0;
@@ -453,7 +473,14 @@ static int native_run(void) {
         last_wall = current_wall;
         if (controller_connected && current_time - last_input > 3000000) {
             controller_connected = 0;
-            notify("DualSense disconnected");
+            virtual_pad.retry_at = 0;
+            physical_address = 0;
+            initialized_output = 0;
+            calibration_requested = 0;
+            last_motion = 0;
+            last_battery = 0;
+            original_capacity = 0;
+            record(log, "controller_disconnected", 1);
         }
         if (current_time - last_stop_check >= 500000) {
             last_stop_check = current_time;
@@ -532,7 +559,7 @@ static int native_run(void) {
         }
         sample.timestamp = current_time;
         ++sample.count;
-        virtual_update(log, &virtual_pad, &sample, current_time, sleep_us, &inserted, &insert_failures);
+        virtual_update(log, &virtual_pad, &sample, current_time, sleep_us, &inserted, &insert_failures, controller_connected);
         if (!ready) { sleep_us(10000); continue; }
         u8 buffer[256];
         long count = call3(3, fd, (long)buffer, sizeof(buffer));
@@ -565,18 +592,23 @@ static int native_run(void) {
                         u64 input_time = now();
                         if (!controller_connected) {
                             controller_connected = 1;
-                            notify("DualSense connected");
-                        }
-                        if (decoded && input_time - last_input > 3000000) {
-                            record(log, "bluetooth_resume_gap", input_time - last_input);
-                            virtual_reset(log, &virtual_pad, input_time);
-                            initialized_output = 0;
-                            calibration_requested = 0;
-                            last_motion = 0;
+                            virtual_pad.retry_at = input_time;
+                            record(log, "controller_connected", 1);
                         }
                         physical_address = address;
                         if (state.extended) {
                             ++extended_count;
+                            if (virtual_pad.handle >= 0 && input_time - last_battery >= 1000000 && info.version == 0x12508001) {
+                                u32 status = state.battery_status == 0 ? 0 : state.battery_status == 1 ? 1 : state.battery_status == 2 ? 2 : 5;
+                                if (status <= 2) {
+                                    u32 level = status == 2 ? 100 : state.battery < 10 ? state.battery * 10 + 5 : 100;
+                                    struct BatteryRequest battery = {(u32)virtual_pad.handle, level, status, 0};
+                                    long battery_rc = call3(11, (long)controller_battery, (long)&battery, 0);
+                                    if (!battery_active || battery_rc) record(log, "battery_update", battery_rc);
+                                    if (!battery_rc) battery_active = 1;
+                                }
+                                last_battery = input_time;
+                            }
                             if (state.touch_active[0] || state.touch_active[1]) ++touch_count;
                             if (state.gyro[0] || state.gyro[1] || state.gyro[2]) ++motion_count;
                             u64 motion_time = now();
@@ -620,6 +652,10 @@ static int native_run(void) {
             struct CapacityRequest capacity = {physical_address, 1, original_capacity};
             record(log, "restore_capacity", call3(11, (long)controller_capacity, (long)&capacity, 0));
         }
+    }
+    if (battery_active) {
+        struct BatteryRequest battery = {0, 0, 0, 1};
+        record(log, "battery_restore", call3(11, (long)controller_battery, (long)&battery, 0));
     }
     if (virtual_pad.handle >= 0) record(log, "delete_virtual", virtual_pad.remove(virtual_pad.handle));
     record(log, "events", events);

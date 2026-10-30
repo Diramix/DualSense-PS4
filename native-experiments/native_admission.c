@@ -28,12 +28,6 @@ __attribute__((noinline)) static long call6(long number, long a, long b, long c,
     return result;
 }
 
-static u64 length(const char *text) {
-    u64 count = 0;
-    while (text[count]) ++count;
-    return count;
-}
-
 static void record(long fd, const char *name, long value) {
     char line[96];
     u64 count = 0;
@@ -47,18 +41,7 @@ static void record(long fd, const char *name, long value) {
     call3(4, fd, (long)line, count);
 }
 
-static void notify(const char *message) {
-    int (*send)(int, void *, u64, int) = 0;
-    if (call3(591, 0x2001, (long)"sceKernelSendNotificationRequest", (long)&send) || !send)
-        return;
-    u8 request[0xc30];
-    for (u64 i = 0; i < sizeof(request); ++i) request[i] = 0;
-    *(int *)(request + 0x10) = -1;
-    u64 count = length(message);
-    if (count > 1023) count = 1023;
-    for (u64 i = 0; i < count; ++i) request[0x2d + i] = message[i];
-    send(0, request, sizeof(request), 0);
-}
+
 
 struct PatchRequest { int restore; };
 struct PatchArgs { void *function; struct PatchRequest *request; };
@@ -106,12 +89,10 @@ static int native_run(void) {
     long rc = call3(11,(long)admission,(long)&request,0);
     record(fd,"admission_apply",rc);
     if (rc) {call3(6,fd,0,0); return 4;}
-    notify("DualSense native registration test: reconnect controller now 180 seconds");
     for (unsigned i = 0; i < 1800; ++i) sleep_us(100000);
     request.restore = 1;
     rc = call3(11,(long)admission,(long)&request,0);
     record(fd,"admission_restore",rc);
-    notify(rc ? "DualSense native registration: restore failed" : "DualSense native registration test finished; admission restored");
     call3(6,fd,0,0);
     return rc != 0;
 }
@@ -129,7 +110,6 @@ __attribute__((section(".text.entry"))) int _start(void) {
     };
     if (call3(104, guard, (long)&address, sizeof(address)) < 0) {
         call3(6, guard, 0, 0);
-        notify("DualSense admission test is already running, or its local port is unavailable");
         return 2;
     }
     void *(*map)(void *, u64, int, int, int, u64) = 0;
