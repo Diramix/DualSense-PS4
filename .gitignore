@@ -1,0 +1,9 @@
+.build/
+__pycache__/
+*.py[cod]
+*.o
+*.elf
+*.bin
+*.so
+*.log
+*.zip
