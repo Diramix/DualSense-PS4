@@ -44,49 +44,234 @@ static void record(long fd, const char *name, long value) {
 
 
 
-struct PatchRequest { int restore; };
-struct PatchArgs { void *function; struct PatchRequest *request; };
-static int patch_allowlist(void *thread, struct PatchArgs *args) {
-    (void)thread;
-    u32 low, high;
-    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(0xc0000082));
-    u64 base = (((u64)high << 32) | low) - 0x1c0;
-    if ((base >> 48) != 0xffff || (base & 0x3fff) || !args->request) return 22;
-    const u32 offsets[10] = {0x5b0da6,0x5b0dd6,0x5b1616,0x5b1649,0x5b53d8,0x5b5fca,0x5b578d,0x5b5c6e,0x5b580b,0x5b5cfe};
-    int restore = args->request->restore;
-    if (restore != 0 && restore != 1) return 22;
-    int (*lock)(void) = (void *)(base + 0x5a6b80);
-    int (*unlock)(int) = (void *)(base + 0x5a6c00);
-    if (*(u64 *)(base + 0x5b6d00) != 0x56415741e5894855UL) return 22;
-    int rc = lock();
-    if (rc) return rc;
-    unsigned original_count = 0, patched_count = 0;
-    for (unsigned i = 0; i < 10; ++i) {
-        u32 old_value = (i & 1) ? 0x1000 : 0x044f;
-        u32 new_value = (i & 1) ? 0x0ce6 : 0x054c;
-        u32 current = *(volatile u32 *)(base + offsets[i]);
-        if (current == old_value) ++original_count;
-        else if (current == new_value) ++patched_count;
-        else { unlock(0); return 0x100 + (int)i; }
-    }
-    if (original_count && patched_count) { unlock(0); return 0x200 + (int)original_count; }
-    if ((!restore && patched_count == 10) || (restore && original_count == 10)) {
-        unlock(0);
-        return 0;
-    }
-    u64 flags, cr0;
-    __asm__ volatile("pushfq; popq %0; cli; mov %%cr0,%1" : "=r"(flags), "=r"(cr0) :: "memory");
-    u64 writable = cr0 & ~(1UL << 16);
-    __asm__ volatile("mov %0,%%cr0" :: "r"(writable) : "memory");
-    for (unsigned i = 0; i < 10; ++i) {
-        u32 old_value = (i & 1) ? 0x1000 : 0x044f;
-        u32 new_value = (i & 1) ? 0x0ce6 : 0x054c;
-        *(volatile u32 *)(base + offsets[i]) = restore ? old_value : new_value;
-    }
-    __asm__ volatile("mov %0,%%cr0; pushq %1; popfq" :: "r"(cr0), "r"(flags) : "memory", "cc");
-    unlock(0);
+struct PatchRequest {
+    int restore;
+    int is_dynamic;                  
+    int detail_code;                 
+    u32 pair_count;             
+    u32 n_vid_found;
+    u32 n_pid_found;
+    u32 discovered_vids[8];
+    u32 discovered_pids[8];
+    u32 discovered_offsets[12]; 
+    u32 discovered_lock;        
+    u32 discovered_unlock;
+    u32 saved_offsets[12];
+    u32 saved_count;
+    u32 saved_lock;
+    u32 saved_unlock;      
+};
+
+struct PatchArgs {
+    void* function;
+    struct PatchRequest* request;
+};
+
+static inline int aob_is_cmp_imm(const u8* p) {
+    u8 b1 = p[-1];
+    u8 b2 = p[-2];
+    u8 b3 = p[-3];
+    
+    if (b1 == 0x3D) return 1;
+    
+    if (b2 == 0x81 && ((b1 >> 3) & 7) == 7) return 1;
+    if (b3 == 0x81 && ((b2 >> 3) & 7) == 7) return 1;
     return 0;
 }
+
+#define AOB_SAFE_SCAN_START 0x004E0000UL
+#define AOB_SAFE_SCAN_END   0x00660000UL
+
+static int aob_find_allowlist_offsets(u64 base, u32 out_offsets[12], u32* out_count, u32* out_lock, u32* out_unlock, struct PatchRequest* req) {
+    u32 vids[8];
+    u32 pids[8];
+    int n_vid = 0, n_pid = 0;
+
+    for (u64 a = base + AOB_SAFE_SCAN_START; a + 4 <= base + AOB_SAFE_SCAN_END; ++a) {
+        if (*(const volatile u32*)a == 0x0000044FUL) {
+            if (aob_is_cmp_imm((const u8*)a)) {
+                if (n_vid == 8) return 0x318;
+                vids[n_vid++] = (u32)(a - base);
+            }
+        }
+    }
+
+    if (req) {
+        req->n_vid_found = n_vid;
+        for (int i = 0; i < n_vid && i < 8; ++i) req->discovered_vids[i] = vids[i];
+    }
+
+    if (n_vid < 5 || n_vid > 6) {
+        return 0x310 + n_vid; 
+    }
+
+    u64 pid_win_start = (base + vids[0] > 0x800) ? (base + vids[0] - 0x800) : (base + vids[0]);
+    u64 pid_win_end   = base + vids[n_vid - 1] + 0x8000;
+    if (pid_win_end > base + AOB_SAFE_SCAN_END) pid_win_end = base + AOB_SAFE_SCAN_END;
+
+    for (u64 a = pid_win_start; a + 4 <= pid_win_end; ++a) {
+        if (*(const volatile u32*)a == 0x00001000UL) {
+            if (aob_is_cmp_imm((const u8*)a)) {
+                if (n_pid == 8) return 0x328;
+                pids[n_pid++] = (u32)(a - base);
+            }
+        }
+    }
+
+    if (req) {
+        req->n_pid_found = n_pid;
+        for (int i = 0; i < n_pid && i < 8; ++i) req->discovered_pids[i] = pids[i];
+    }
+
+    if (n_pid < 5) {
+        return 0x320 + n_pid; 
+    }
+
+    int pid_used[8] = {0};
+    u32 pairs = 0;
+
+    for (int i = 0; i < n_vid && pairs < 6; ++i) {
+        u32 v = vids[i];
+        int best_idx = -1;
+        u32 best_dist = 0xFFFFFFFFU;
+
+        for (int j = 0; j < n_pid; ++j) {
+            if (pid_used[j]) continue;
+            u32 p = pids[j];
+            if (p > v && (p - v) < 4096) {
+                u32 dist = p - v;
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_idx = j;
+                }
+            }
+        }
+
+        if (best_idx < 0) {
+            for (int j = 0; j < n_pid; ++j) {
+                if (pid_used[j]) continue;
+                u32 p = pids[j];
+                u32 dist = (p > v) ? (p - v) : (v - p);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_idx = j;
+                }
+            }
+        }
+
+        if (best_idx >= 0) {
+            pid_used[best_idx] = 1;
+            out_offsets[2 * pairs]     = v;
+            out_offsets[2 * pairs + 1] = pids[best_idx];
+            ++pairs;
+        }
+    }
+
+    if (pairs != (u32)n_vid) {
+        return 0x330 + pairs;
+    }
+
+    *out_count = pairs;
+
+    *out_lock = 0;
+    *out_unlock = 0;
+
+    return 0;
+}
+
+static int patch_allowlist(void* thread, struct PatchArgs* args) {
+    (void)thread;
+    u32 low, high;
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(0xC0000082));
+    u64 base = (((u64)high << 32) | low) - 0x1C0;
+
+    if ((base >> 48) != 0xFFFF || (base & 0x3FFF) || !args || !args->request) {
+        return 22; 
+    }
+
+    struct PatchRequest* req = args->request;
+    int restore = req->restore;
+    if (restore != 0 && restore != 1) return 22;
+
+    u32 lock_off = 0;
+    u32 unlock_off = 0;
+    u32 active_offsets[12];
+    u32 total_offsets = 10;
+
+        if (restore && req->saved_count) {
+            total_offsets = req->saved_count;
+            for (u32 i = 0; i < total_offsets; ++i) active_offsets[i] = req->saved_offsets[i];
+            req->is_dynamic = 1;
+            req->pair_count = total_offsets / 2;
+            lock_off = req->saved_lock;
+            unlock_off = req->saved_unlock;
+        } else {
+            u32 pair_count = 0;
+            int aob_rc = aob_find_allowlist_offsets(base, active_offsets, &pair_count, &lock_off, &unlock_off, req);
+            req->detail_code = aob_rc;
+            if (aob_rc != 0) {
+                return 45; 
+            }
+            total_offsets = pair_count * 2;
+            for (u32 i = 0; i < total_offsets; ++i) req->saved_offsets[i] = active_offsets[i];
+            req->saved_count = total_offsets;
+            req->saved_lock = lock_off;
+            req->saved_unlock = unlock_off;
+            req->is_dynamic = 1;
+            req->pair_count = pair_count;
+        }
+
+    for (u32 i = 0; i < total_offsets; ++i) req->discovered_offsets[i] = active_offsets[i];
+    req->discovered_lock = lock_off;
+    req->discovered_unlock = unlock_off;
+
+    int (*lock)(void) = lock_off ? (void*)(base + lock_off) : 0;
+    int (*unlock)(int) = unlock_off ? (void*)(base + unlock_off) : 0;
+
+    if (lock) {
+        int rc = lock();
+        if (rc) return rc;
+    }
+
+    unsigned original_count = 0, patched_count = 0;
+    for (unsigned i = 0; i < total_offsets; ++i) {
+        u32 old_value = (i & 1) ? 0x1000 : 0x044F;
+        u32 new_value = (i & 1) ? 0x0CE6 : 0x054C;
+        u32 current = *(volatile u32*)(base + active_offsets[i]);
+        if (current == old_value) ++original_count;
+        else if (current == new_value) ++patched_count;
+        else {
+            if (unlock) unlock(0);
+            return 0x100 + (int)i;
+        }
+    }
+
+    if (original_count && patched_count) {
+        if (unlock) unlock(0);
+        return 0x200 + (int)original_count;
+    }
+
+    if ((!restore && patched_count == total_offsets) || (restore && original_count == total_offsets)) {
+        if (unlock) unlock(0);
+        return 0;
+    }
+
+    u64 flags, cr0;
+    __asm__ volatile("pushfq; popq %0; cli; mov %%cr0, %1" : "=r"(flags), "=r"(cr0) :: "memory");
+    u64 writable = cr0 & ~(1UL << 16);
+    __asm__ volatile("mov %0, %%cr0" :: "r"(writable) : "memory");
+
+    for (unsigned i = 0; i < total_offsets; ++i) {
+        u32 old_value = (i & 1) ? 0x1000 : 0x044F;
+        u32 new_value = (i & 1) ? 0x0CE6 : 0x054C;
+        *(volatile u32*)(base + active_offsets[i]) = restore ? old_value : new_value;
+    }
+
+    __asm__ volatile("mov %0, %%cr0; pushq %1; popfq" :: "r"(cr0), "r"(flags) : "memory", "cc");
+    if (unlock) unlock(0);
+    return 0;
+}
+
 
 #include "dualsense.h"
 typedef struct {
@@ -390,7 +575,7 @@ static int native_run(void) {
     rc = version(&info);
     record(log, "get_version", rc);
     record(log, "firmware", info.version);
-    if (rc || (info.version >> 16) != 0x1250) {
+    if (rc) {
         call3(6, log, 0, 0);
         return 3;
     }
@@ -417,6 +602,8 @@ static int native_run(void) {
     struct PatchRequest patch_request = {0};
     rc = call3(11, (long)patch_allowlist, (long)&patch_request, 0);
     record(log, "apply_temporary_allowlist", rc);
+    record(log, "patch_detail", patch_request.detail_code);
+    record(log, "patch_pairs", patch_request.pair_count);
     if (rc) { call3(6, queue, 0, 0); call3(6, fd, 0, 0); call3(6, log, 0, 0); return 8; }
     struct { u16 vendor; u16 product; } device = { 0x054c, 0x0ce6 };
     rc = call3(54, fd, 0x8004622bUL, (long)&device);
@@ -531,7 +718,7 @@ static int native_run(void) {
             for (unsigned i = 0; i < 5; ++i) if (values[i] != previous_feedback[i]) changed = 1;
             if (changed || current_time - last_output >= 1000000) {
                 struct CapacityRequest capacity = {physical_address, 0, 0};
-                long cap_rc = call3(11, (long)controller_capacity, (long)&capacity, 0);
+                long cap_rc = info.version == 0x12508001 ? call3(11, (long)controller_capacity, (long)&capacity, 0) : 45;
                 if (!cap_rc) {
                     if (capacity.original != 78 || !original_capacity) original_capacity = capacity.original;
                     u8 color[3];
