@@ -54,7 +54,7 @@ struct PatchRequest {
     u32 n_vid_found;
     u32 n_pid_found;
     u32 discovered_vids[8];
-    u32 discovered_pids[8];
+    u32 discovered_pids[128];
     u32 discovered_offsets[12];
     u32 discovered_lock;
     u32 discovered_unlock;
@@ -87,7 +87,7 @@ static inline int aob_is_cmp_imm(const u8* p) {
 
 static int aob_find_allowlist_offsets(u64 base, u32 out_offsets[12], u32* out_count, u32* out_lock, u32* out_unlock, struct PatchRequest* req) {
     u32 vids[8];
-    u32 pids[8];
+    u32 pids[128];
     int n_vid = 0, n_pid = 0;
 
     for (u64 a = base + AOB_SAFE_SCAN_START; a + 4 <= base + AOB_SAFE_SCAN_END; ++a) {
@@ -95,8 +95,13 @@ static int aob_find_allowlist_offsets(u64 base, u32 out_offsets[12], u32* out_co
         if (*(const volatile u32*)a == 0x0000044FUL) {
 
             if (aob_is_cmp_imm((const u8*)a)) {
-                if (n_vid == 8) return 0x318;
-                vids[n_vid++] = (u32)(a - base);
+                if (n_vid == 8) {
+                    req->n_vid_found = 9;
+                    return 0x318;
+                }
+                vids[n_vid] = (u32)(a - base);
+                req->discovered_vids[n_vid] = vids[n_vid];
+                ++n_vid;
             }
         }
     }
@@ -120,22 +125,27 @@ static int aob_find_allowlist_offsets(u64 base, u32 out_offsets[12], u32* out_co
         if (*(const volatile u32*)a == 0x00001000UL) {
 
             if (aob_is_cmp_imm((const u8*)a)) {
-                if (n_pid == 8) return 0x328;
-                pids[n_pid++] = (u32)(a - base);
+                if (n_pid == 128) {
+                    req->n_pid_found = 129;
+                    return 0x328;
+                }
+                pids[n_pid] = (u32)(a - base);
+                req->discovered_pids[n_pid] = pids[n_pid];
+                ++n_pid;
             }
         }
     }
 
     if (req) {
         req->n_pid_found = n_pid;
-        for (int i = 0; i < n_pid && i < 8; ++i) req->discovered_pids[i] = pids[i];
+        for (int i = 0; i < n_pid && i < 128; ++i) req->discovered_pids[i] = pids[i];
     }
 
     if (n_pid < 5) {
         return 0x320 + n_pid;
     }
 
-    int pid_used[8] = {0};
+    int pid_used[128] = {0};
     u32 pairs = 0;
 
     for (int i = 0; i < n_vid && pairs < 6; ++i) {
@@ -825,6 +835,11 @@ static int native_run(void) {
     record(log, "apply_temporary_allowlist", rc);
     record(log, "patch_detail", patch_request.detail_code);
     record(log, "patch_pairs", patch_request.pair_count);
+    record(log, "patch_vid_count", patch_request.n_vid_found);
+    record(log, "patch_pid_count", patch_request.n_pid_found);
+    for (u32 i = 0; i < patch_request.n_vid_found && i < 8; ++i) record(log, "patch_vid_offset", patch_request.discovered_vids[i]);
+    for (u32 i = 0; i < patch_request.n_pid_found && i < 128; ++i) record(log, "patch_pid_offset", patch_request.discovered_pids[i]);
+    for (u32 i = 0; i < patch_request.pair_count * 2 && i < 12; ++i) record(log, "patch_offset", patch_request.discovered_offsets[i]);
 
     if (rc) {
         call3(6, queue, 0, 0);
