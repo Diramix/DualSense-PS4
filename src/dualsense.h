@@ -21,12 +21,12 @@ typedef struct {
     uint8_t touch_id[2];
     uint8_t touch_active[2];
 } DualSenseState;
-int dualsense_decode_bluetooth(const uint8_t *report, size_t length, DualSenseState *state);
+int dualsense_decode_bluetooth(const uint8_t* report, size_t length, DualSenseState* state);
 typedef struct {
     float gyro_scale[3];
     float accel_scale[3];
     float accel_bias[3];
 } DualSenseCalibration;
-int dualsense_calibration_bluetooth(const uint8_t *report, size_t length, DualSenseCalibration *calibration);
+int dualsense_calibration_bluetooth(const uint8_t* report, size_t length, DualSenseCalibration* calibration);
 void dualsense_output_bluetooth(uint8_t report[78], uint8_t sequence, uint8_t large, uint8_t small, const uint8_t color[3], int reset_leds);
 #endif

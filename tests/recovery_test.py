@@ -4,10 +4,11 @@ import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
 source = (root / 'src/native.c').read_text()
-structure = source[source.index('struct VirtualPad {'):source.index('static const char *find_text')]
-gap = source[source.index('static int resume_gap('):source.index('static long wall_seconds(')]
-function = source[source.index('static void virtual_reset('):source.index('struct CapacityRequest')]
-harness = r'''
+structure = source[source.index('struct VirtualPad {') : source.index('static const char* find_text')]
+gap = source[source.index('static int resume_gap(') : source.index('static long wall_seconds(')]
+function = source[source.index('static void virtual_reset(') : source.index('struct CapacityRequest')]
+harness = (
+    r"""
 #include <assert.h>
 typedef unsigned long u64;
 typedef unsigned int u32;
@@ -68,10 +69,13 @@ int main(void) {
     virtual_update(0,&pad,&sample,7000000,0,&ok,&failed,1);
     assert(pad.handle==42 && starts==4);
 }
-'''.replace('STRUCTURE', structure).replace('FUNCTION', function).replace('GAP', gap)
+""".replace('STRUCTURE', structure)
+    .replace('FUNCTION', function)
+    .replace('GAP', gap)
+)
 with tempfile.TemporaryDirectory() as directory:
     path = pathlib.Path(directory)
     (path / 'test.c').write_text(harness)
-    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(path/'test.c'),'-o',str(path/'test')],check=True)
-    subprocess.run([str(path/'test')],check=True)
+    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(path / 'test.c'), '-o', str(path / 'test')], check=True)
+    subprocess.run([str(path / 'test')], check=True)
 print('Recovery checks passed: transient failure, lost handle, retry delay, failed recreation, successful recovery')

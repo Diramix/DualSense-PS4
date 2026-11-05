@@ -13,7 +13,22 @@ with tempfile.TemporaryDirectory() as directory:
     decode = lib.dualsense_decode_bluetooth
     decode.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
     state = ctypes.create_string_buffer(256)
-    vectors = [(9,4,0x8000),(9,5,0x4000),(9,6,0x2000),(9,7,0x1000),(10,0,0x400),(10,1,0x800),(10,2,0x100),(10,3,0x200),(10,4,1),(10,5,8),(10,6,2),(10,7,4),(11,0,0x10000),(11,1,0x100000)]
+    vectors = [
+        (9, 4, 0x8000),
+        (9, 5, 0x4000),
+        (9, 6, 0x2000),
+        (9, 7, 0x1000),
+        (10, 0, 0x400),
+        (10, 1, 0x800),
+        (10, 2, 0x100),
+        (10, 3, 0x200),
+        (10, 4, 1),
+        (10, 5, 8),
+        (10, 6, 2),
+        (10, 7, 4),
+        (11, 0, 0x10000),
+        (11, 1, 0x100000),
+    ]
     for offset, bit, expected in vectors:
         packet = bytearray(78)
         packet[0], packet[9] = 0x31, 8
@@ -21,7 +36,7 @@ with tempfile.TemporaryDirectory() as directory:
         packet[74:] = zlib.crc32(b'\xa1' + packet[:74]).to_bytes(4, 'little')
         assert decode(bytes(packet), 78, state) == 0
         assert struct.unpack_from('<I', state.raw)[0] == expected
-    for direction, expected in enumerate([16,48,32,96,64,192,128,144,0]):
+    for direction, expected in enumerate([16, 48, 32, 96, 64, 192, 128, 144, 0]):
         packet = bytearray(78)
         packet[0], packet[9] = 0x31, direction
         packet[74:] = zlib.crc32(b'\xa1' + packet[:74]).to_bytes(4, 'little')
@@ -42,14 +57,14 @@ with tempfile.TemporaryDirectory() as directory:
     assert decode(bytes(packet), 78, state) == -2
     assert state.raw == saved
     assert decode(bytes(packet), 77, state) == -1
-    assert decode(bytes([1,128,128,128,128,8,0,0,0,0]), 10, state) == 0
+    assert decode(bytes([1, 128, 128, 128, 128, 8, 0, 0, 0, 0]), 10, state) == 0
     assert state.raw[11] == 0
     output = ctypes.create_string_buffer(78)
-    color = ctypes.create_string_buffer(bytes([20,30,40]))
+    color = ctypes.create_string_buffer(bytes([20, 30, 40]))
     lib.dualsense_output_bluetooth(output, 7, 110, 90, color, 0)
     packet = output.raw
-    assert packet[:7] == bytes([49,112,16,3,20,90,110])
-    assert packet[47:50] == bytes([20,30,40])
+    assert packet[:7] == bytes([49, 112, 16, 3, 20, 90, 110])
+    assert packet[47:50] == bytes([20, 30, 40])
     assert int.from_bytes(packet[74:], 'little') == zlib.crc32(b'\xa2' + packet[:74])
     calibration = bytearray(41)
     calibration[0] = 5
